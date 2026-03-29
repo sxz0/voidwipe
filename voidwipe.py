@@ -1060,11 +1060,12 @@ LIMITATIONS
         )
     )
     passes.add_argument(
-        "--freespace-passes", type=int, default=2, metavar="N",
+        "--freespace-passes", type=int, default=None, metavar="N",
         help=(
             "Number of overwrite passes for --freespace "
-            "(default: 2). Each pass fills the free space with a "
-            "different pattern before the fill file is removed."
+            "(default: matches --method / --passes). Each pass fills "
+            "the free space with a different pattern before the fill "
+            "file is removed. Set explicitly to decouple from file passes."
         )
     )
     passes.add_argument(
@@ -1181,7 +1182,8 @@ def main():
             for n in range(1, extra + 1):
                 sequence.append((f"Random (extra {n})", pattern_random))
 
-    log.info(f"Pass method: {args.method} | Passes: {len(sequence)} | Verify: {args.verify}")
+    freespace_passes = args.freespace_passes if args.freespace_passes is not None else len(sequence)
+    log.info(f"Pass method: {args.method} | File passes: {len(sequence)} | Free space passes: {freespace_passes} | Verify: {args.verify}")
 
     results = []
     # Collect unique mount points that need fstrim after deletions
@@ -1218,7 +1220,7 @@ def main():
         log.info("\n-- Free Space Overwrite -------------------------------------------")
         info = detect_storage(args.freespace)
         log_storage_info(info)
-        ok = overwrite_free_space(args.freespace, passes=args.freespace_passes, dry_run=args.dry_run)
+        ok = overwrite_free_space(args.freespace, passes=freespace_passes, dry_run=args.dry_run)
         results.append(("Free space", ok))
         if args.trim and info.mount_point:
             trim_mounts.add(info.mount_point)
