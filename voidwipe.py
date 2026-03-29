@@ -6,26 +6,30 @@ Features:
   - Secure deletion of files and directories
   - Gutmann / DoD / custom pass methods
   - Shadow Copies / Snapshots removal (requires admin)
+  - SSD-aware: automatic storage detection, TRIM, ATA Secure Erase,
+    NVMe Sanitize, LUKS crypto-erase
   - Dry-run mode and read-back verification
   - Detailed process logging
 
-WARNING: Primarily effective on HDDs.
-On SSDs, the FTL/TRIM layer limits guarantees of physical overwrite.
+On SSDs, multi-pass overwrite is BEST-EFFORT only.
+FTL wear-leveling and over-provisioning may retain data beyond OS reach.
 On Copy-on-Write filesystems (btrfs, ZFS, APFS), overwrite does NOT
 guarantee physical data erasure regardless of storage type.
 """
 
 import os
 import sys
+import re
 import platform
 import logging
 import argparse
 import subprocess
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 # ─────────────────────────────────────────────
@@ -97,6 +101,366 @@ def warn_if_cow(path: str):
                 "Physical overwrite is NOT guaranteed even on HDDs."
             )
             return
+
+
+# ─────────────────────────────────────────────
+# STORAGE DETECTION
+# ─────────────────────────────────────────────
+
+@dataclass
+class StorageInfo:
+    path: str
+    device: str = ""         # e.g. /dev/sda1
+    base_device: str = ""    # e.g. /dev/sda  (no partition suffix)
+    mount_point: str = ""    # e.g. /home
+    is_ssd: bool = None      # True/False/None (None = unknown)
+    is_nvme: bool = False
+    is_encrypted: bool = False
+
+    def type_label(self) -> str:
+        if self.is_nvme:
+            return "NVMe SSD"
+        if self.is_ssd is True:
+            return "SSD"
+        if self.is_ssd is False:
+            return "HDD"
+        return "unknown"
+
+
+def _df_info(path: str):
+    """Return (device, mount_point) via 'df -P', or ('', '') on failure."""
+    try:
+        result = subprocess.run(
+            ["df", "-P", path], capture_output=True, text=True, timeout=5
+        )
+        lines = result.stdout.strip().splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            return parts[0], parts[-1]
+    except Exception:
+        pass
+    return "", ""
+
+
+def _base_device(device: str) -> str:
+    """Strip partition suffix to get the bare block device name."""
+    # /dev/nvme0n1p1 → /dev/nvme0n1
+    m = re.match(r"(/dev/nvme\d+n\d+)p\d+$", device)
+    if m:
+        return m.group(1)
+    # /dev/sda1 → /dev/sda, /dev/vda2 → /dev/vda
+    m = re.match(r"(/dev/[a-z]+)\d+$", device)
+    if m:
+        return m.group(1)
+    return device
+
+
+def _is_ssd_linux(base_device: str):
+    """Read /sys/block/.../queue/rotational: '0' → SSD, '1' → HDD, None → unknown."""
+    name = os.path.basename(base_device)
+    rotational = Path(f"/sys/block/{name}/queue/rotational")
+    try:
+        return rotational.read_text().strip() == "0"
+    except OSError:
+        return None
+
+
+def _is_ssd_macos(device: str):
+    """Use 'diskutil info' to detect SSD on macOS."""
+    try:
+        result = subprocess.run(
+            ["diskutil", "info", device],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if "Solid State" in line:
+                return "yes" in line.lower()
+    except Exception:
+        pass
+    return None
+
+
+def _is_ssd_windows():
+    """Use PowerShell Get-PhysicalDisk to detect SSD on Windows (approximate)."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-PhysicalDisk | Select-Object -ExpandProperty MediaType"],
+            capture_output=True, text=True, timeout=10
+        )
+        types = result.stdout.lower()
+        if "ssd" in types:
+            return True
+        if "hdd" in types or "unspecified" not in types:
+            return False
+    except Exception:
+        pass
+    return None
+
+
+def _is_encrypted_linux(device: str) -> bool:
+    """Check if the device is a LUKS container or dm-crypt device."""
+    try:
+        r = subprocess.run(
+            ["cryptsetup", "isLuks", device],
+            capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            return True
+        # Also check if lsblk shows a 'crypt' type in the device stack
+        r2 = subprocess.run(
+            ["lsblk", "-sno", "TYPE", device],
+            capture_output=True, text=True, timeout=5
+        )
+        return "crypt" in r2.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def detect_storage(path: str) -> StorageInfo:
+    """
+    Inspect the block device backing the given path.
+    Returns a StorageInfo with device type, SSD flag, and encryption status.
+    """
+    info = StorageInfo(path=path)
+
+    if SYSTEM in ("Linux", "Darwin"):
+        device, mount = _df_info(path)
+        info.device = device
+        info.mount_point = mount
+        info.base_device = _base_device(device)
+        info.is_nvme = "nvme" in device.lower()
+
+        if SYSTEM == "Linux":
+            info.is_ssd = _is_ssd_linux(info.base_device)
+            # NVMe is always SSD — fill in if rotational file is absent
+            if info.is_ssd is None and info.is_nvme:
+                info.is_ssd = True
+            info.is_encrypted = _is_encrypted_linux(device)
+        else:
+            info.is_ssd = _is_ssd_macos(info.base_device or device)
+            if info.is_ssd is None and info.is_nvme:
+                info.is_ssd = True
+
+    elif SYSTEM == "Windows":
+        info.is_ssd = _is_ssd_windows()
+
+    return info
+
+
+def log_storage_info(info: StorageInfo):
+    """Log storage type and targeted warnings based on detection results."""
+    enc = " [ENCRYPTED]" if info.is_encrypted else ""
+    log.info(f"  Storage: {info.device or 'unknown'} [{info.type_label()}]{enc}")
+
+    if info.is_ssd:
+        log.warning(
+            "  SSD detected — multi-pass overwrite proceeds as BEST-EFFORT. "
+            "FTL wear-leveling and over-provisioning may retain data."
+        )
+        if info.is_encrypted:
+            log.info(
+                "  Volume appears encrypted. Use --disk-crypto-erase to destroy "
+                "the key for the strongest SSD erasure guarantee (erases entire volume)."
+            )
+        else:
+            log.warning(
+                "  For stronger guarantees: use --trim (advisory), "
+                "--disk-secure-erase (whole disk), or encrypt first then --disk-crypto-erase (whole volume)."
+            )
+    elif info.is_ssd is None:
+        log.warning("  Storage type unknown — treating overwrite as best-effort.")
+
+
+# ─────────────────────────────────────────────
+# SSD-SPECIFIC OPERATIONS
+# ─────────────────────────────────────────────
+
+def fstrim_mount(mount_point: str, dry_run: bool = False) -> bool:
+    """
+    Issue fstrim on a filesystem mount point (Linux only).
+    Advisory only: signals free blocks to drive firmware; actual cell erasure
+    depends on the drive and may be deferred or incomplete.
+    """
+    if SYSTEM != "Linux":
+        log.warning("  fstrim is only supported on Linux.")
+        return False
+
+    log.info(f"  Running fstrim on {mount_point}...")
+    log.warning("  fstrim is advisory — the drive may not erase cells immediately.")
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would run: fstrim -v {mount_point}")
+        return True
+
+    try:
+        result = subprocess.run(
+            ["fstrim", "-v", mount_point],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            log.info(f"  fstrim: {result.stdout.strip()}")
+            return True
+        log.warning(f"  fstrim returned code {result.returncode}: {result.stderr.strip()}")
+        return False
+    except FileNotFoundError:
+        log.error("  fstrim not found. Install it with: apt install util-linux")
+        return False
+
+
+def ata_secure_erase(device: str, dry_run: bool = False) -> bool:
+    """
+    Perform ATA Secure Erase on a SATA drive (Linux, requires root).
+    Erases all data including over-provisioned and FTL-remapped cells.
+    WHOLE-DRIVE operation — requires --force.
+    """
+    if SYSTEM != "Linux":
+        log.error("  ATA Secure Erase is only supported on Linux.")
+        return False
+
+    log.info(f"  ATA Secure Erase: {device}")
+    log.warning("  This erases ALL data on the drive including hidden/over-provisioned areas.")
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would run: hdparm --security-erase on {device}")
+        return True
+
+    try:
+        # Check for 'frozen' security state — cannot erase if frozen
+        info_r = subprocess.run(
+            ["hdparm", "-I", device], capture_output=True, text=True
+        )
+        if "frozen" in info_r.stdout.lower():
+            log.error(
+                "  Drive security state is 'frozen'. Cannot issue Secure Erase.\n"
+                "  To unfreeze: suspend/resume the system (sleep+wake), then retry."
+            )
+            return False
+
+        # Set a temporary password (required by ATA spec before erase)
+        subprocess.run(
+            ["hdparm", "--security-set-pass", "voidwipe_tmp", device],
+            capture_output=True, check=True
+        )
+        # Issue the erase
+        result = subprocess.run(
+            ["hdparm", "--security-erase", "voidwipe_tmp", device],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            log.info(f"  ATA Secure Erase completed: {device}")
+            return True
+        log.error(f"  Secure Erase failed (code {result.returncode}): {result.stderr.strip()}")
+        return False
+
+    except FileNotFoundError:
+        log.error("  hdparm not found. Install it with: apt install hdparm")
+        return False
+    except subprocess.CalledProcessError as e:
+        log.error(f"  hdparm error: {e}")
+        return False
+
+
+def nvme_sanitize(device: str, dry_run: bool = False) -> bool:
+    """
+    Run NVMe Sanitize on an NVMe drive (Linux, requires root).
+    Attempts crypto-erase first (sanact=4); falls back to block-erase (sanact=2).
+    WHOLE-DRIVE operation — requires --force.
+    """
+    if SYSTEM != "Linux":
+        log.error("  NVMe Sanitize is only supported on Linux.")
+        return False
+
+    log.info(f"  NVMe Sanitize: {device}")
+    log.warning("  This erases ALL data on the NVMe drive.")
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would run: nvme sanitize {device} --sanact=4")
+        return True
+
+    try:
+        # Try crypto-erase first (fastest, most thorough)
+        for sanact, label in [("4", "crypto-erase"), ("2", "block-erase")]:
+            result = subprocess.run(
+                ["nvme", "sanitize", device, f"--sanact={sanact}"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                log.info(
+                    f"  NVMe Sanitize ({label}) initiated on {device}.\n"
+                    f"  Monitor progress with: nvme sanitize-log {device}"
+                )
+                return True
+            log.warning(f"  {label} not supported, trying next option...")
+
+        log.error(f"  NVMe Sanitize failed: {result.stderr.strip()}")
+        return False
+
+    except FileNotFoundError:
+        log.error("  nvme-cli not found. Install it with: apt install nvme-cli")
+        return False
+
+
+def secure_erase_device(device: str, dry_run: bool = False) -> bool:
+    """Auto-detect NVMe vs SATA and dispatch to the appropriate secure erase."""
+    if "nvme" in os.path.basename(device).lower():
+        return nvme_sanitize(device, dry_run=dry_run)
+    else:
+        return ata_secure_erase(device, dry_run=dry_run)
+
+
+def crypto_erase_luks(device: str, dry_run: bool = False) -> bool:
+    """
+    Destroy all LUKS key slots on a LUKS-encrypted device (Linux, requires root).
+    Renders all ciphertext — including FTL-remapped SSD cells — computationally
+    unrecoverable without key material. The strongest per-volume SSD guarantee.
+    IRREVERSIBLE — requires --force.
+    """
+    if SYSTEM != "Linux":
+        log.error("  LUKS crypto-erase is only supported on Linux.")
+        return False
+
+    log.info(f"  LUKS Crypto-Erase: {device}")
+    log.warning(
+        "  All LUKS key slots will be destroyed. "
+        "Data will be permanently inaccessible — no recovery possible."
+    )
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would run: cryptsetup erase {device}")
+        return True
+
+    try:
+        # Verify it is actually a LUKS device before proceeding
+        check = subprocess.run(
+            ["cryptsetup", "isLuks", device],
+            capture_output=True, timeout=5
+        )
+        if check.returncode != 0:
+            log.error(f"  {device} does not appear to be a LUKS device.")
+            return False
+
+        result = subprocess.run(
+            ["cryptsetup", "erase", "--batch-mode", device],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            log.info(
+                f"  All LUKS key slots erased on {device}. "
+                "Data is now cryptographically inaccessible."
+            )
+            return True
+        log.error(
+            f"  cryptsetup erase failed (code {result.returncode}): {result.stderr.strip()}"
+        )
+        return False
+
+    except FileNotFoundError:
+        log.error("  cryptsetup not found. Install it with: apt install cryptsetup")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("  cryptsetup timed out.")
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -204,7 +568,7 @@ _FREE_SPACE_PATTERN_CYCLE = [_make_fixed(0x00), _make_fixed(0xFF), pattern_rando
 # SECURE FILE DELETION
 # ─────────────────────────────────────────────
 
-CHUNK_SIZE = 1024 * 1024       # 1 MB per chunk
+CHUNK_SIZE = 1024 * 1024               # 1 MB per chunk
 FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
 
 
@@ -215,7 +579,7 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
     and compared against the expected bytes.
     """
     if file_size == 0:
-        return  # nothing to overwrite
+        return
 
     show_progress = file_size >= 4 * 1024 * 1024  # only for files >= 4 MB
 
@@ -247,7 +611,6 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         os.fsync(f.fileno())  # Force physical write to disk
 
         if verify and not is_random and last_chunk is not None:
-            # Spot-check: read back the last chunk and compare
             f.seek(file_size - len(last_chunk))
             read_back = f.read(len(last_chunk))
             if read_back == last_chunk:
@@ -260,6 +623,7 @@ def shred_file(filepath: str, sequence: list = None, dry_run: bool = False,
                verify: bool = False) -> bool:
     """
     Overwrites a file with multiple passes, renames it, then deletes it.
+    Storage detection and warnings are handled by the caller.
     Returns True on success.
     """
     path = Path(filepath)
@@ -556,75 +920,222 @@ def delete_snapshots() -> bool:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="voidwipe — Cross-platform secure file deletion",
+        prog="voidwipe",
+        description=(
+            "voidwipe — Cross-platform secure file deletion\n\n"
+            "Overwrites files, directories, and free space using multi-pass techniques\n"
+            "before unlinking. Detects storage type (HDD/SSD/NVMe) and CoW filesystems\n"
+            "automatically. On SSDs, multi-pass overwrite is best-effort only — use the\n"
+            "SSD-specific options below for stronger guarantees."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Pass methods:
-  default   4 passes: random, 0xFF, random, 0x00
-  dod3      DoD 5220.22-M 3-pass: 0x00, 0xFF, random
-  dod7      DoD 5220.22-M 7-pass
-  gutmann   Gutmann 35-pass
+────────────────────────────────────────────────────────────────
+PASS METHODS
+────────────────────────────────────────────────────────────────
+  default   4 passes: random → 0xFF → random → 0x00  (recommended)
+  dod3      DoD 5220.22-M basic:  0x00 → 0xFF → random
+  dod7      DoD 5220.22-M extended: 7 passes
+  gutmann   Gutmann 35-pass (slowest, highest theoretical assurance on HDDs)
 
-Examples:
-  # Securely delete specific files
-  voidwipe --files secret.txt report.pdf
+Use --passes N to override the pass count; passes beyond the method's
+built-in count are filled with additional random-data passes.
 
-  # Securely delete an entire directory
+────────────────────────────────────────────────────────────────
+SSD ERASURE GUARANTEE TIERS  (weakest → strongest)
+────────────────────────────────────────────────────────────────
+  1. Multi-pass overwrite (always runs)
+       Best-effort on SSDs. FTL wear-leveling may keep copies of blocks
+       in over-provisioned NAND cells that are never rewritten by the OS.
+
+  2. --trim  (Linux only, advisory)
+       Sends fstrim to the filesystem, hinting the drive to zero free blocks.
+       Not guaranteed — drive firmware decides when/whether to act on it.
+
+  3. --disk-secure-erase DEVICE  (requires --force + root)
+       Issues ATA Secure Erase (HDDs/SATA SSDs) or NVMe Sanitize to the
+       drive firmware. Erases ALL cells including over-provisioned area.
+       *** DESTROYS ALL DATA ON THE ENTIRE DEVICE ***
+
+  4. --disk-crypto-erase DEVICE  (requires --force + root)
+       Destroys all LUKS key slots on an encrypted volume. The ciphertext
+       remains on disk but is permanently unreadable without the key.
+       *** ENTIRE VOLUME BECOMES UNREADABLE ***
+
+────────────────────────────────────────────────────────────────
+EXAMPLES
+────────────────────────────────────────────────────────────────
+  # Securely delete files (auto-detects HDD/SSD, warns if CoW filesystem)
+  voidwipe --files secret.txt credentials.pdf
+
+  # Shred an entire directory tree
   voidwipe --dir /home/user/sensitive/
 
-  # Overwrite free space on a partition
+  # Overwrite free space on a partition (hides previously deleted files)
   voidwipe --freespace /home
 
-  # Full run with DoD 7-pass, verification, and logging
+  # DoD 7-pass with read-back verification and a log file
   voidwipe --files secret.txt --method dod7 --verify --log voidwipe.log
 
-  # Dry run to preview all actions without making changes
+  # SSD: delete files and send advisory TRIM hint
+  voidwipe --files secret.txt --trim
+
+  # SSD: delete + NVMe whole-disk sanitize (ERASES ENTIRE DISK)
+  sudo voidwipe --files secret.txt --disk-secure-erase /dev/nvme0n1 --force
+
+  # SSD: destroy LUKS key slots (ENTIRE VOLUME BECOMES UNREADABLE)
+  sudo voidwipe --disk-crypto-erase /dev/sda --force
+
+  # Remove VSS / LVM / APFS snapshots (requires root/admin)
+  sudo voidwipe --snapshots
+
+  # Preview all actions without making any changes
   voidwipe --files secret.txt --freespace /home --dry-run
 
-WARNING: Physical overwrite cannot be guaranteed on SSDs or CoW filesystems (btrfs, ZFS, APFS).
+────────────────────────────────────────────────────────────────
+LIMITATIONS
+────────────────────────────────────────────────────────────────
+  SSD / NVMe    FTL and wear-leveling prevent guaranteed block overwrite.
+  btrfs/ZFS/APFS  Copy-on-Write: originals may persist after overwrite.
+  Encrypted volumes  Prefer cryptographic key destruction over overwriting.
+  Network filesystems  Physical guarantees depend on the remote system.
         """
     )
     parser.add_argument("--version", action="version", version=f"voidwipe {VERSION}")
-    parser.add_argument(
+
+    # ── File / directory targets ──────────────────────────────────────────────
+    targets = parser.add_argument_group("targets — what to wipe")
+    targets.add_argument(
         "--files", nargs="+", metavar="FILE",
-        help="Files to securely delete"
+        help=(
+            "One or more files to securely overwrite and delete. "
+            "Each file is overwritten with the selected pass method, "
+            "then renamed to a random name before unlinking."
+        )
     )
-    parser.add_argument(
+    targets.add_argument(
         "--dir", metavar="DIRECTORY",
-        help="Directory to recursively shred (all files inside)"
+        help=(
+            "Recursively shred every file inside DIRECTORY, then remove "
+            "the directory tree. Equivalent to running --files on each "
+            "file in the tree."
+        )
     )
-    parser.add_argument(
+    targets.add_argument(
         "--freespace", metavar="DIRECTORY",
-        help="Directory whose partition free space will be overwritten"
+        help=(
+            "Overwrite free blocks on the partition that contains DIRECTORY. "
+            "Fills available space with patterned data to obscure previously "
+            "deleted files, then removes the temporary fill file. "
+            "Use --freespace-passes to control how many passes are written."
+        )
     )
-    parser.add_argument(
+    targets.add_argument(
         "--snapshots", action="store_true",
-        help="Delete system Shadow Copies / Snapshots (requires admin)"
+        help=(
+            "Delete system-level snapshots before wiping: "
+            "VSS Shadow Copies (Windows), LVM snapshots (Linux), "
+            "APFS snapshots (macOS). Requires administrator / root privileges."
+        )
     )
-    parser.add_argument(
+
+    # ── Pass / overwrite configuration ───────────────────────────────────────
+    passes = parser.add_argument_group("pass configuration")
+    passes.add_argument(
         "--method", choices=list(PASS_METHODS.keys()), default="default",
-        help="Pass method for file deletion (default: default)"
+        metavar="METHOD",
+        help=(
+            "Overwrite pattern sequence to use. "
+            "Choices: default (4-pass), dod3 (3-pass), dod7 (7-pass), gutmann (35-pass). "
+            "(default: default)"
+        )
     )
-    parser.add_argument(
-        "--passes", type=int, default=None,
-        help="Override number of passes from the selected method (min: 1); "
-             "if greater than the method's pass count, extra random passes are appended"
+    passes.add_argument(
+        "--passes", type=int, default=None, metavar="N",
+        help=(
+            "Override the total number of overwrite passes (minimum: 1). "
+            "If N is greater than the chosen method's built-in count, "
+            "the extra passes use random data. "
+            "If N is smaller, the method is truncated to N passes."
+        )
     )
-    parser.add_argument(
-        "--freespace-passes", type=int, default=2,
-        help="Number of passes for free space overwrite (default: 2)"
+    passes.add_argument(
+        "--freespace-passes", type=int, default=2, metavar="N",
+        help=(
+            "Number of overwrite passes for --freespace "
+            "(default: 2). Each pass fills the free space with a "
+            "different pattern before the fill file is removed."
+        )
     )
-    parser.add_argument(
+    passes.add_argument(
         "--verify", action="store_true",
-        help="Read-back verify each deterministic overwrite pass"
+        help=(
+            "After each deterministic overwrite pass (fixed byte patterns), "
+            "read the written data back and confirm it matches. "
+            "Skipped for random-data passes. Adds time but confirms "
+            "the drive accepted the writes."
+        )
     )
-    parser.add_argument(
+
+    # ── SSD-specific operations ───────────────────────────────────────────────
+    ssd = parser.add_argument_group(
+        "SSD operations",
+        "Stronger erasure guarantees for SSDs beyond multi-pass overwrite."
+    )
+    ssd.add_argument(
+        "--trim", action="store_true",
+        help=(
+            "Run fstrim on the target filesystem(s) after deletion (Linux only). "
+            "Advisory: tells the drive firmware which blocks are free so it may "
+            "zero them internally. Not guaranteed — supplement, don't replace, "
+            "other methods."
+        )
+    )
+    ssd.add_argument(
+        "--disk-secure-erase", metavar="DEVICE",
+        help=(
+            "*** WHOLE-DISK OPERATION *** "
+            "Issue ATA Secure Erase (SATA) or NVMe Sanitize (NVMe) to DEVICE "
+            "(e.g. /dev/sda or /dev/nvme0n1). The drive firmware erases every "
+            "cell including over-provisioned NAND — all data on the device is "
+            "permanently destroyed. Requires --force and root privileges."
+        )
+    )
+    ssd.add_argument(
+        "--disk-crypto-erase", metavar="DEVICE",
+        help=(
+            "*** WHOLE-VOLUME OPERATION *** "
+            "Destroy all LUKS key slots on DEVICE. The encrypted ciphertext "
+            "remains on disk but is permanently unreadable without the key. "
+            "Strongest per-volume guarantee for LUKS-encrypted SSDs. "
+            "Requires --force and root privileges."
+        )
+    )
+    ssd.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Confirm intentionally destructive whole-disk / whole-volume "
+            "operations. Required by --disk-secure-erase and --disk-crypto-erase "
+            "to prevent accidental data loss."
+        )
+    )
+
+    # ── General ───────────────────────────────────────────────────────────────
+    general = parser.add_argument_group("general")
+    general.add_argument(
         "--dry-run", action="store_true",
-        help="Preview all actions without making any changes"
+        help=(
+            "Preview every action that would be taken without writing, "
+            "deleting, or modifying anything. Useful for verifying the "
+            "scope of an operation before committing."
+        )
     )
-    parser.add_argument(
-        "--log", metavar="LOG_FILE",
-        help="Save detailed log to a file"
+    general.add_argument(
+        "--log", metavar="FILE",
+        help=(
+            "Write a timestamped, detailed log of all operations to FILE. "
+            "Log output is appended to the file if it already exists."
+        )
     )
     return parser.parse_args()
 
@@ -644,7 +1155,16 @@ def main():
     if not is_admin():
         log.warning("Not running as administrator/root. Some features may fail.")
 
-    if not any([args.files, args.dir, args.freespace, args.snapshots]):
+    # Validate destructive whole-disk flags require --force
+    if (args.disk_secure_erase or args.disk_crypto_erase) and not args.force and not args.dry_run:
+        log.error(
+            "--disk-secure-erase and --disk-crypto-erase are whole-disk destructive operations.\n"
+            "Re-run with --force to confirm, or use --dry-run to preview."
+        )
+        sys.exit(1)
+
+    if not any([args.files, args.dir, args.freespace, args.snapshots,
+                args.disk_secure_erase, args.disk_crypto_erase]):
         log.error("No action specified. Use --help to see available options.")
         sys.exit(1)
 
@@ -664,6 +1184,8 @@ def main():
     log.info(f"Pass method: {args.method} | Passes: {len(sequence)} | Verify: {args.verify}")
 
     results = []
+    # Collect unique mount points that need fstrim after deletions
+    trim_mounts: set = set()
 
     # 1. Delete snapshots first (before touching the disk)
     if args.snapshots:
@@ -674,20 +1196,51 @@ def main():
     if args.files:
         log.info("\n-- Secure File Deletion -------------------------------------------")
         for f in args.files:
+            info = detect_storage(f)
+            log_storage_info(info)
             ok = shred_file(f, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
             results.append((f"File: {f}", ok))
+            if args.trim and info.mount_point:
+                trim_mounts.add(info.mount_point)
 
     # 3. Secure directory deletion
     if args.dir:
         log.info("\n-- Secure Directory Deletion --------------------------------------")
+        info = detect_storage(args.dir)
+        log_storage_info(info)
         ok = shred_dir(args.dir, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
         results.append((f"Dir: {args.dir}", ok))
+        if args.trim and info.mount_point:
+            trim_mounts.add(info.mount_point)
 
     # 4. Free space overwrite
     if args.freespace:
         log.info("\n-- Free Space Overwrite -------------------------------------------")
+        info = detect_storage(args.freespace)
+        log_storage_info(info)
         ok = overwrite_free_space(args.freespace, passes=args.freespace_passes, dry_run=args.dry_run)
         results.append(("Free space", ok))
+        if args.trim and info.mount_point:
+            trim_mounts.add(info.mount_point)
+
+    # 5. TRIM (advisory, after all deletions so freed blocks are maximised)
+    if args.trim and trim_mounts:
+        log.info("\n-- TRIM -----------------------------------------------------------")
+        for mount in sorted(trim_mounts):
+            ok = fstrim_mount(mount, dry_run=args.dry_run)
+            results.append((f"TRIM: {mount}", ok))
+
+    # 6. ATA Secure Erase / NVMe Sanitize (whole disk)
+    if args.disk_secure_erase:
+        log.info("\n-- Disk Secure Erase (WHOLE DISK) --------------------------------")
+        ok = secure_erase_device(args.disk_secure_erase, dry_run=args.dry_run)
+        results.append((f"Disk Secure Erase: {args.disk_secure_erase}", ok))
+
+    # 7. LUKS crypto-erase (destroy key slots, whole volume)
+    if args.disk_crypto_erase:
+        log.info("\n-- Disk Crypto-Erase (WHOLE VOLUME) ------------------------------")
+        ok = crypto_erase_luks(args.disk_crypto_erase, dry_run=args.dry_run)
+        results.append((f"Disk Crypto-Erase: {args.disk_crypto_erase}", ok))
 
     # Final summary
     log.info("\n-- Summary --------------------------------------------------------")

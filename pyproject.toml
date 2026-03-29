@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voidwipe"
+version = "1.2.0"
+description = "Cross-platform secure file deletion, free space overwriting, and snapshot removal"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+readme = "README.md"
+
+[project.scripts]
+voidwipe = "voidwipe:main"
+
+[tool.setuptools]
+py-modules = ["voidwipe"]

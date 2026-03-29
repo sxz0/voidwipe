@@ -27,6 +27,12 @@ ENV/
 env/
 .env
 
+# pip / setuptools build artifacts
+*.egg-info/
+dist/
+build/
+__pycache__/
+
 # voidwipe runtime artifacts
 *.tmp
 _freespace_*.tmp

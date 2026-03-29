@@ -38,10 +38,25 @@ Platform-specific optional tools (used when available):
 ```bash
 git clone https://github.com/youruser/voidwipe.git
 cd voidwipe
-chmod +x voidwipe.py
+pip install .
 ```
 
-No installation required — run directly with Python.
+This registers the `voidwipe` command in your Python environment's `bin` directory (Unix) or `Scripts` directory (Windows), so you can run it directly without `python3 voidwipe.py`.
+
+For development (editable install — changes to `voidwipe.py` take effect immediately):
+
+```bash
+pip install -e .
+```
+
+**Platform notes**
+
+| Platform | Command registered at |
+|---|---|
+| Linux / macOS | `~/.local/bin/voidwipe` (user) or `/usr/local/bin/voidwipe` (system with `sudo pip`) |
+| Windows | `%APPDATA%\Python\Scripts\voidwipe.exe` (user) or `C:\PythonXY\Scripts\voidwipe.exe` (system) |
+
+Ensure the relevant `bin` / `Scripts` directory is in your `PATH`. Most Python installers on all platforms handle this automatically.
 
 ---
 
