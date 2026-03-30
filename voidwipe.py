@@ -20,6 +20,7 @@ guarantee physical data erasure regardless of storage type.
 import os
 import sys
 import re
+import time
 import platform
 import logging
 import argparse
@@ -590,6 +591,7 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         written = 0
         last_chunk = None
         last_pct_milestone = 0
+        pass_start = time.monotonic()
 
         while written < file_size:
             chunk_size = min(CHUNK_SIZE, file_size - written)
@@ -609,6 +611,8 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
 
         f.flush()
         os.fsync(f.fileno())  # Force physical write to disk
+        elapsed = time.monotonic() - pass_start
+        log.info(f"    Done in {elapsed:.1f}s")
 
         if verify and not is_random and last_chunk is not None:
             f.seek(file_size - len(last_chunk))
@@ -782,6 +786,7 @@ def overwrite_free_space(directory: str, passes: int = 2, dry_run: bool = False)
         log.info(f"  Pass {p}/{passes} — pattern: {label}")
         tmp_path = target / f"_freespace_{p}_{os.urandom(4).hex()}.tmp"
         total_written = 0
+        pass_start = time.monotonic()
 
         try:
             with open(tmp_path, "wb") as f:
@@ -795,10 +800,12 @@ def overwrite_free_space(directory: str, passes: int = 2, dry_run: bool = False)
                     os.fsync(f.fileno())
                     total_written += chunk
 
-            log.info(f"  Written {total_written / (1024**2):.1f} MB.")
+            elapsed = time.monotonic() - pass_start
+            log.info(f"  Written {total_written / (1024**2):.1f} MB in {elapsed:.1f}s.")
         except OSError as e:
             if e.errno == 28:  # No space left on device — expected
-                log.info(f"  Disk full (expected). Pass {p} complete.")
+                elapsed = time.monotonic() - pass_start
+                log.info(f"  Disk full (expected). Pass {p} complete in {elapsed:.1f}s.")
             else:
                 log.error(f"  Write error: {e}")
         finally:
