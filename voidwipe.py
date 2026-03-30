@@ -21,6 +21,8 @@ import os
 import sys
 import re
 import time
+import json
+import fnmatch
 import platform
 import logging
 import argparse
@@ -37,12 +39,18 @@ VERSION = "1.2.0"
 # LOGGING SETUP
 # ─────────────────────────────────────────────
 
-def setup_logging(log_file: str = None):
-    handlers = [logging.StreamHandler(sys.stdout)]
+def setup_logging(log_file: str = None, quiet: bool = False, json_mode: bool = False):
+    # Suppress stdout INFO when --json is active so JSON output is not polluted.
+    stream_level = logging.WARNING if (quiet or json_mode) else logging.DEBUG
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(stream_level)
+    handlers = [stream_handler]
     if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        handlers.append(file_handler)
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
@@ -612,7 +620,8 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         f.flush()
         os.fsync(f.fileno())  # Force physical write to disk
         elapsed = time.monotonic() - pass_start
-        log.info(f"    Done in {elapsed:.1f}s")
+        mbps = (file_size / (1024 ** 2)) / elapsed if elapsed > 0 else 0
+        log.info(f"    Done in {elapsed:.1f}s ({mbps:.1f} MB/s)")
 
         if verify and not is_random and last_chunk is not None:
             f.seek(file_size - len(last_chunk))
@@ -681,7 +690,7 @@ def shred_file(filepath: str, sequence: list = None, dry_run: bool = False,
 
 
 def shred_dir(dirpath: str, sequence: list = None, dry_run: bool = False,
-              verify: bool = False) -> bool:
+              verify: bool = False, exclude: list = None, force: bool = False) -> bool:
     """
     Recursively shreds all files inside a directory, then removes the empty tree.
     Symlinks are unlinked without following them.
@@ -695,9 +704,18 @@ def shred_dir(dirpath: str, sequence: list = None, dry_run: bool = False,
         log.error(f"Not a directory: {dirpath}")
         return False
 
-    files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+    def _is_excluded(p: Path) -> bool:
+        if not exclude:
+            return False
+        return any(fnmatch.fnmatch(p.name, pat) for pat in exclude)
+
+    files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink() and not _is_excluded(p))
+    skipped = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink() and _is_excluded(p))
     links = sorted(p for p in root.rglob("*") if p.is_symlink())
-    log.info(f"Recursively shredding: {dirpath} ({len(files)} file(s), {len(links)} symlink(s))")
+    skip_note = f", {len(skipped)} excluded" if skipped else ""
+    log.info(f"Recursively shredding: {dirpath} ({len(files)} file(s), {len(links)} symlink(s){skip_note})")
+    for p in skipped:
+        log.info(f"  Excluded: {p}")
     warn_if_cow(dirpath)
 
     if dry_run:
@@ -707,6 +725,16 @@ def shred_dir(dirpath: str, sequence: list = None, dry_run: bool = False,
             log.info(f"  [DRY RUN] Would unlink symlink: {s}")
         log.info(f"  [DRY RUN] Would remove directory tree: {dirpath}")
         return True
+
+    if not force:
+        try:
+            answer = input(f"  About to shred {len(files)} file(s) in '{dirpath}'. Proceed? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            log.info("  Aborted.")
+            return False
+        if answer.strip().lower() != "y":
+            log.info("  Aborted.")
+            return False
 
     all_ok = True
     for f in files:
@@ -782,7 +810,8 @@ def overwrite_free_space(directory: str, passes: int = 2, dry_run: bool = False)
 
     for p in range(1, passes + 1):
         gen = _FREE_SPACE_PATTERN_CYCLE[(p - 1) % len(_FREE_SPACE_PATTERN_CYCLE)]
-        label = getattr(gen, '__name__', 'Random')
+        raw_label = getattr(gen, '__name__', 'Random')
+        label = "Random" if raw_label == "pattern_random" else raw_label
         log.info(f"  Pass {p}/{passes} — pattern: {label}")
         tmp_path = target / f"_freespace_{p}_{os.urandom(4).hex()}.tmp"
         total_written = 0
@@ -801,20 +830,28 @@ def overwrite_free_space(directory: str, passes: int = 2, dry_run: bool = False)
                     total_written += chunk
 
             elapsed = time.monotonic() - pass_start
-            log.info(f"  Written {total_written / (1024**2):.1f} MB in {elapsed:.1f}s.")
+            mbps = (total_written / (1024 ** 2)) / elapsed if elapsed > 0 else 0
+            log.info(f"  Written {total_written / (1024**2):.1f} MB in {elapsed:.1f}s ({mbps:.1f} MB/s).")
         except OSError as e:
             if e.errno == 28:  # No space left on device — expected
                 elapsed = time.monotonic() - pass_start
-                log.info(f"  Disk full (expected). Pass {p} complete in {elapsed:.1f}s.")
+                mbps = (total_written / (1024 ** 2)) / elapsed if elapsed > 0 else 0
+                log.info(f"  Disk full (expected). Pass {p} complete in {elapsed:.1f}s ({mbps:.1f} MB/s).")
             else:
                 log.error(f"  Write error: {e}")
         finally:
             if tmp_path.exists():
-                # Zero the temp file before unlinking to limit raw block recovery
+                # Zero the temp file before unlinking to limit raw block recovery.
+                # Written in chunks to avoid MemoryError on large files.
                 try:
                     size = tmp_path.stat().st_size
+                    zero_chunk = b'\x00' * CHUNK_SIZE
                     with open(tmp_path, "r+b") as f:
-                        f.write(b'\x00' * size)
+                        remaining = size
+                        while remaining > 0:
+                            n = min(CHUNK_SIZE, remaining)
+                            f.write(zero_chunk[:n])
+                            remaining -= n
                         f.flush()
                         os.fsync(f.fileno())
                 except Exception:
@@ -1021,11 +1058,26 @@ LIMITATIONS
         )
     )
     targets.add_argument(
+        "--files-from", metavar="FILE",
+        help=(
+            "Read file paths to shred from FILE, one path per line. "
+            "Use '-' to read from stdin (e.g. find . -name '*.key' | voidwipe --files-from -). "
+            "Paths are processed in addition to any --files arguments."
+        )
+    )
+    targets.add_argument(
         "--dir", metavar="DIRECTORY",
         help=(
             "Recursively shred every file inside DIRECTORY, then remove "
             "the directory tree. Equivalent to running --files on each "
-            "file in the tree."
+            "file in the tree. Prompts for confirmation unless --force is given."
+        )
+    )
+    targets.add_argument(
+        "--exclude", nargs="+", metavar="PATTERN",
+        help=(
+            "Glob pattern(s) to skip when using --dir (e.g. '*.log' '*.tmp'). "
+            "Matched against filename only, not the full path."
         )
     )
     targets.add_argument(
@@ -1122,14 +1174,27 @@ LIMITATIONS
     ssd.add_argument(
         "--force", action="store_true",
         help=(
-            "Confirm intentionally destructive whole-disk / whole-volume "
-            "operations. Required by --disk-secure-erase and --disk-crypto-erase "
-            "to prevent accidental data loss."
+            "Skip confirmation prompts. Required by --disk-secure-erase and "
+            "--disk-crypto-erase; also bypasses the --dir confirmation prompt."
         )
     )
 
     # ── General ───────────────────────────────────────────────────────────────
     general = parser.add_argument_group("general")
+    general.add_argument(
+        "-q", "--quiet", action="store_true",
+        help=(
+            "Suppress all informational output; only errors and warnings are printed. "
+            "Useful for scripts and cron jobs that rely on the exit code."
+        )
+    )
+    general.add_argument(
+        "--json", action="store_true",
+        help=(
+            "Print the session summary as a JSON object to stdout instead of the "
+            "standard log format. Useful for parsing results in scripts."
+        )
+    )
     general.add_argument(
         "--dry-run", action="store_true",
         help=(
@@ -1150,7 +1215,7 @@ LIMITATIONS
 
 def main():
     args = parse_args()
-    setup_logging(args.log)
+    setup_logging(args.log, quiet=args.quiet, json_mode=args.json)
 
     log.info("=" * 60)
     log.info("voidwipe — Secure deletion session started")
@@ -1171,7 +1236,19 @@ def main():
         )
         sys.exit(1)
 
-    if not any([args.files, args.dir, args.freespace, args.snapshots,
+    # Resolve --files-from
+    files_from_list = []
+    if args.files_from:
+        src = sys.stdin if args.files_from == "-" else open(args.files_from, encoding="utf-8")
+        try:
+            files_from_list = [line.rstrip("\r\n") for line in src if line.strip()]
+        finally:
+            if src is not sys.stdin:
+                src.close()
+
+    all_files = list(args.files or []) + files_from_list
+
+    if not any([all_files, args.dir, args.freespace, args.snapshots,
                 args.disk_secure_erase, args.disk_crypto_erase]):
         log.error("No action specified. Use --help to see available options.")
         sys.exit(1)
@@ -1192,6 +1269,7 @@ def main():
     freespace_passes = args.freespace_passes if args.freespace_passes is not None else len(sequence)
     log.info(f"Pass method: {args.method} | File passes: {len(sequence)} | Free space passes: {freespace_passes} | Verify: {args.verify}")
 
+    session_start = time.monotonic()
     results = []
     # Collect unique mount points that need fstrim after deletions
     trim_mounts: set = set()
@@ -1202,9 +1280,9 @@ def main():
         results.append(("Snapshots", delete_snapshots()))
 
     # 2. Secure file deletion
-    if args.files:
+    if all_files:
         log.info("\n-- Secure File Deletion -------------------------------------------")
-        for f in args.files:
+        for f in all_files:
             info = detect_storage(f)
             log_storage_info(info)
             ok = shred_file(f, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
@@ -1217,7 +1295,8 @@ def main():
         log.info("\n-- Secure Directory Deletion --------------------------------------")
         info = detect_storage(args.dir)
         log_storage_info(info)
-        ok = shred_dir(args.dir, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
+        ok = shred_dir(args.dir, sequence=sequence, dry_run=args.dry_run, verify=args.verify,
+                       exclude=args.exclude, force=args.force)
         results.append((f"Dir: {args.dir}", ok))
         if args.trim and info.mount_point:
             trim_mounts.add(info.mount_point)
@@ -1252,16 +1331,25 @@ def main():
         results.append((f"Disk Crypto-Erase: {args.disk_crypto_erase}", ok))
 
     # Final summary
-    log.info("\n-- Summary --------------------------------------------------------")
-    all_ok = True
-    for label, ok in results:
-        status = "OK  " if ok else "FAIL"
-        log.info(f"  [{status}]  {label}")
-        if not ok:
-            all_ok = False
+    session_elapsed = time.monotonic() - session_start
+    all_ok = all(ok for _, ok in results)
 
-    log.info("=" * 60)
-    log.info("Session complete." + (" With errors." if not all_ok else " No errors."))
+    if args.json:
+        summary = {
+            "status": "ok" if all_ok else "errors",
+            "elapsed_s": round(session_elapsed, 1),
+            "results": [{"label": label, "ok": ok} for label, ok in results],
+        }
+        print(json.dumps(summary))
+    else:
+        log.info("\n-- Summary --------------------------------------------------------")
+        for label, ok in results:
+            status = "OK  " if ok else "FAIL"
+            log.info(f"  [{status}]  {label}")
+        log.info("=" * 60)
+        log.info("Session complete in {:.1f}s.".format(session_elapsed)
+                 + (" With errors." if not all_ok else " No errors."))
+
     sys.exit(0 if all_ok else 1)
 
 
