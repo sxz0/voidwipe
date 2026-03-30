@@ -410,12 +410,102 @@ def nvme_sanitize(device: str, dry_run: bool = False) -> bool:
         return False
 
 
+def _get_device_transport(device: str) -> str:
+    """
+    Return the transport string for a block device (e.g. 'usb', 'sata', 'nvme', '').
+    Uses lsblk on Linux; returns '' if unavailable or not Linux.
+    """
+    if SYSTEM != "Linux":
+        return ""
+    try:
+        result = subprocess.run(
+            ["lsblk", "-dno", "TRAN", device],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
 def secure_erase_device(device: str, dry_run: bool = False) -> bool:
-    """Auto-detect NVMe vs SATA and dispatch to the appropriate secure erase."""
+    """Auto-detect transport/interface and dispatch to the appropriate secure erase."""
+    transport = _get_device_transport(device)
+
+    if transport == "usb":
+        log.error(
+            f"  {device} is connected via USB. ATA Secure Erase commands are blocked "
+            "by USB bridges and will silently do nothing.\n"
+            f"  Use --wipe-device {device} to perform a direct multi-pass overwrite instead."
+        )
+        return False
+
     if "nvme" in os.path.basename(device).lower():
         return nvme_sanitize(device, dry_run=dry_run)
     else:
         return ata_secure_erase(device, dry_run=dry_run)
+
+
+def wipe_device(device: str, sequence: list, dry_run: bool = False,
+                verify: bool = False) -> bool:
+    """
+    Directly overwrite a block device (e.g. /dev/sda, /dev/sdb) using the
+    selected pass sequence. Works on any device the OS exposes as a block
+    device, including USB drives where ATA Secure Erase is unavailable.
+    WHOLE-DEVICE operation — requires --force.
+    """
+    dev_path = Path(device)
+    if not dev_path.exists():
+        log.error(f"  Device not found: {device}")
+        return False
+
+    # Determine device size via lsblk (Linux) or fallback seek
+    size = None
+    if SYSTEM == "Linux":
+        try:
+            result = subprocess.run(
+                ["lsblk", "-dno", "SIZE", "--bytes", device],
+                capture_output=True, text=True, timeout=5
+            )
+            size = int(result.stdout.strip())
+        except Exception:
+            pass
+
+    if size is None:
+        # Fallback: open and seek to end
+        try:
+            with open(device, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+        except Exception as e:
+            log.error(f"  Could not determine device size: {e}")
+            return False
+
+    transport = _get_device_transport(device)
+    transport_note = f" [{transport.upper()}]" if transport else ""
+    log.info(
+        f"  Device: {device}{transport_note} | Size: {size / (1024**3):.2f} GB | "
+        f"Passes: {len(sequence)}"
+    )
+    log.warning(
+        "  WHOLE-DEVICE overwrite — all data will be permanently destroyed. "
+        "On SSDs, physical erasure depends on FTL; this is best-effort."
+    )
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would overwrite {size / (1024**3):.2f} GB on {device}")
+        return True
+
+    try:
+        with open(device, "r+b") as f:
+            _write_passes(f, size, sequence, verify=verify)
+        log.info(f"  Device overwrite complete: {device}")
+        return True
+    except PermissionError:
+        log.error(f"  Permission denied: {device}. Run with sudo.")
+        return False
+    except OSError as e:
+        log.error(f"  Error writing to {device}: {e}")
+        return False
 
 
 def crypto_erase_luks(device: str, dry_run: bool = False) -> bool:
@@ -1152,6 +1242,16 @@ LIMITATIONS
         )
     )
     ssd.add_argument(
+        "--wipe-device", metavar="DEVICE",
+        help=(
+            "*** WHOLE-DEVICE OPERATION *** "
+            "Directly overwrite every byte of DEVICE (e.g. /dev/sda, /dev/sdb) "
+            "using the selected pass method. Works on all drive types including "
+            "USB drives where ATA Secure Erase is unavailable. "
+            "Requires --force and root privileges."
+        )
+    )
+    ssd.add_argument(
         "--disk-secure-erase", metavar="DEVICE",
         help=(
             "*** WHOLE-DISK OPERATION *** "
@@ -1229,7 +1329,7 @@ def main():
         log.warning("Not running as administrator/root. Some features may fail.")
 
     # Validate destructive whole-disk flags require --force
-    if (args.disk_secure_erase or args.disk_crypto_erase) and not args.force and not args.dry_run:
+    if (args.disk_secure_erase or args.disk_crypto_erase or args.wipe_device) and not args.force and not args.dry_run:
         log.error(
             "--disk-secure-erase and --disk-crypto-erase are whole-disk destructive operations.\n"
             "Re-run with --force to confirm, or use --dry-run to preview."
@@ -1249,7 +1349,7 @@ def main():
     all_files = list(args.files or []) + files_from_list
 
     if not any([all_files, args.dir, args.freespace, args.snapshots,
-                args.disk_secure_erase, args.disk_crypto_erase]):
+                args.disk_secure_erase, args.disk_crypto_erase, args.wipe_device]):
         log.error("No action specified. Use --help to see available options.")
         sys.exit(1)
 
@@ -1318,7 +1418,14 @@ def main():
             ok = fstrim_mount(mount, dry_run=args.dry_run)
             results.append((f"TRIM: {mount}", ok))
 
-    # 6. ATA Secure Erase / NVMe Sanitize (whole disk)
+    # 6. Direct device overwrite (works on USB and any block device)
+    if args.wipe_device:
+        log.info("\n-- Device Wipe (WHOLE DEVICE) ------------------------------------")
+        ok = wipe_device(args.wipe_device, sequence=sequence, dry_run=args.dry_run,
+                         verify=args.verify)
+        results.append((f"Device Wipe: {args.wipe_device}", ok))
+
+    # 7. ATA Secure Erase / NVMe Sanitize (whole disk)
     if args.disk_secure_erase:
         log.info("\n-- Disk Secure Erase (WHOLE DISK) --------------------------------")
         ok = secure_erase_device(args.disk_secure_erase, dry_run=args.dry_run)
