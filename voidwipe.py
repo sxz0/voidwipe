@@ -269,13 +269,13 @@ def log_storage_info(info: StorageInfo):
         )
         if info.is_encrypted:
             log.info(
-                "  Volume appears encrypted. Use --disk-crypto-erase to destroy "
+                "  Volume appears encrypted. Use --erase to destroy "
                 "the key for the strongest SSD erasure guarantee (erases entire volume)."
             )
         else:
             log.warning(
-                "  For stronger guarantees: use --trim (advisory), "
-                "--disk-secure-erase (whole disk), or encrypt first then --disk-crypto-erase (whole volume)."
+                "  For stronger guarantees: use --erase (firmware-level whole-disk erase), "
+                "or encrypt first and then --erase (destroys the key, strongest per-volume guarantee)."
             )
     elif info.is_ssd is None:
         log.warning("  Storage type unknown — treating overwrite as best-effort.")
@@ -427,18 +427,38 @@ def _get_device_transport(device: str) -> str:
         return ""
 
 
-def secure_erase_device(device: str, dry_run: bool = False) -> bool:
-    """Auto-detect transport/interface and dispatch to the appropriate secure erase."""
+def erase_device(device: str, dry_run: bool = False) -> bool:
+    """
+    Strongest available erase for DEVICE:
+      1. If LUKS-encrypted: destroy all key slots (crypto-erase).
+      2. Otherwise: ATA Secure Erase (SATA) or NVMe Sanitize (NVMe).
+    USB devices are rejected — use --overwrite instead.
+    WHOLE-DEVICE operation — requires --force.
+    """
     transport = _get_device_transport(device)
 
     if transport == "usb":
         log.error(
-            f"  {device} is connected via USB. ATA Secure Erase commands are blocked "
+            f"  {device} is connected via USB. Firmware-level erase commands are blocked "
             "by USB bridges and will silently do nothing.\n"
-            f"  Use --wipe-device {device} to perform a direct multi-pass overwrite instead."
+            f"  Use --overwrite {device} to perform a direct multi-pass overwrite instead."
         )
         return False
 
+    # Try LUKS crypto-erase first (strongest per-volume guarantee on SSDs)
+    if SYSTEM == "Linux":
+        try:
+            check = subprocess.run(
+                ["cryptsetup", "isLuks", device],
+                capture_output=True, timeout=5
+            )
+            if check.returncode == 0:
+                log.info(f"  LUKS device detected — using crypto-erase for strongest guarantee.")
+                return crypto_erase_luks(device, dry_run=dry_run)
+        except FileNotFoundError:
+            pass  # cryptsetup not installed; fall through to ATA/NVMe
+
+    # Fall back to ATA Secure Erase or NVMe Sanitize
     if "nvme" in os.path.basename(device).lower():
         return nvme_sanitize(device, dry_run=dry_run)
     else:
@@ -1078,23 +1098,20 @@ built-in count are filled with additional random-data passes.
 ────────────────────────────────────────────────────────────────
 SSD ERASURE GUARANTEE TIERS  (weakest → strongest)
 ────────────────────────────────────────────────────────────────
-  1. Multi-pass overwrite (always runs)
-       Best-effort on SSDs. FTL wear-leveling may keep copies of blocks
-       in over-provisioned NAND cells that are never rewritten by the OS.
+  1. Multi-pass overwrite (--files, --dir, --freespace)
+       Best-effort on SSDs. FTL wear-leveling may keep copies in
+       over-provisioned NAND cells that the OS cannot reach.
 
-  2. --trim  (Linux only, advisory)
-       Sends fstrim to the filesystem, hinting the drive to zero free blocks.
-       Not guaranteed — drive firmware decides when/whether to act on it.
-
-  3. --disk-secure-erase DEVICE  (requires --force + root)
-       Issues ATA Secure Erase (HDDs/SATA SSDs) or NVMe Sanitize to the
-       drive firmware. Erases ALL cells including over-provisioned area.
+  2. --overwrite DEVICE  (requires --force + root)
+       Writes over every addressable byte of DEVICE in software.
+       Works on USB drives. Still subject to FTL on SSDs.
        *** DESTROYS ALL DATA ON THE ENTIRE DEVICE ***
 
-  4. --disk-crypto-erase DEVICE  (requires --force + root)
-       Destroys all LUKS key slots on an encrypted volume. The ciphertext
-       remains on disk but is permanently unreadable without the key.
-       *** ENTIRE VOLUME BECOMES UNREADABLE ***
+  3. --erase DEVICE  (requires --force + root)
+       Firmware-level erase — strongest available method:
+       LUKS crypto-erase if encrypted, else ATA/NVMe Secure Erase.
+       Not supported on USB drives.
+       *** DESTROYS ALL DATA ON THE ENTIRE DEVICE / VOLUME ***
 
 ────────────────────────────────────────────────────────────────
 EXAMPLES
@@ -1111,14 +1128,11 @@ EXAMPLES
   # DoD 7-pass with read-back verification and a log file
   voidwipe --files secret.txt --method dod7 --verify --log voidwipe.log
 
-  # SSD: delete files and send advisory TRIM hint
-  voidwipe --files secret.txt --trim
+  # Overwrite every byte of a USB drive (software, works on USB)
+  sudo voidwipe --overwrite /dev/sdb --force
 
-  # SSD: delete + NVMe whole-disk sanitize (ERASES ENTIRE DISK)
-  sudo voidwipe --files secret.txt --disk-secure-erase /dev/nvme0n1 --force
-
-  # SSD: destroy LUKS key slots (ENTIRE VOLUME BECOMES UNREADABLE)
-  sudo voidwipe --disk-crypto-erase /dev/sda --force
+  # Firmware-level erase of an SSD (strongest: LUKS or ATA/NVMe Secure Erase)
+  sudo voidwipe --erase /dev/sda --force
 
   # Remove VSS / LVM / APFS snapshots (requires root/admin)
   sudo voidwipe --snapshots
@@ -1227,55 +1241,37 @@ LIMITATIONS
         )
     )
 
-    # ── SSD-specific operations ───────────────────────────────────────────────
-    ssd = parser.add_argument_group(
-        "SSD operations",
-        "Stronger erasure guarantees for SSDs beyond multi-pass overwrite."
+    # ── Device operations ─────────────────────────────────────────────────────
+    dev = parser.add_argument_group(
+        "device operations",
+        "Whole-device operations. Both require --force and root privileges."
     )
-    ssd.add_argument(
-        "--trim", action="store_true",
-        help=(
-            "Run fstrim on the target filesystem(s) after deletion (Linux only). "
-            "Advisory: tells the drive firmware which blocks are free so it may "
-            "zero them internally. Not guaranteed — supplement, don't replace, "
-            "other methods."
-        )
-    )
-    ssd.add_argument(
-        "--wipe-device", metavar="DEVICE",
+    dev.add_argument(
+        "--overwrite", metavar="DEVICE",
         help=(
             "*** WHOLE-DEVICE OPERATION *** "
-            "Directly overwrite every byte of DEVICE (e.g. /dev/sda, /dev/sdb) "
-            "using the selected pass method. Works on all drive types including "
-            "USB drives where ATA Secure Erase is unavailable. "
+            "Write over every byte of DEVICE (e.g. /dev/sda) using the selected "
+            "pass method. Software-level; works on all drive types including USB. "
+            "On SSDs, physical erasure is best-effort due to FTL wear-leveling. "
             "Requires --force and root privileges."
         )
     )
-    ssd.add_argument(
-        "--disk-secure-erase", metavar="DEVICE",
+    dev.add_argument(
+        "--erase", metavar="DEVICE",
         help=(
-            "*** WHOLE-DISK OPERATION *** "
-            "Issue ATA Secure Erase (SATA) or NVMe Sanitize (NVMe) to DEVICE "
-            "(e.g. /dev/sda or /dev/nvme0n1). The drive firmware erases every "
-            "cell including over-provisioned NAND — all data on the device is "
-            "permanently destroyed. Requires --force and root privileges."
-        )
-    )
-    ssd.add_argument(
-        "--disk-crypto-erase", metavar="DEVICE",
-        help=(
-            "*** WHOLE-VOLUME OPERATION *** "
-            "Destroy all LUKS key slots on DEVICE. The encrypted ciphertext "
-            "remains on disk but is permanently unreadable without the key. "
-            "Strongest per-volume guarantee for LUKS-encrypted SSDs. "
+            "*** WHOLE-DEVICE OPERATION *** "
+            "Apply the strongest available firmware-level erase to DEVICE: "
+            "LUKS crypto-erase if the device is encrypted (destroys key slots), "
+            "otherwise ATA Secure Erase (SATA) or NVMe Sanitize (NVMe). "
+            "Not supported on USB drives — use --overwrite instead. "
             "Requires --force and root privileges."
         )
     )
-    ssd.add_argument(
+    dev.add_argument(
         "--force", action="store_true",
         help=(
-            "Skip confirmation prompts. Required by --disk-secure-erase and "
-            "--disk-crypto-erase; also bypasses the --dir confirmation prompt."
+            "Skip confirmation prompts. Required by --overwrite and --erase; "
+            "also bypasses the --dir confirmation prompt."
         )
     )
 
@@ -1329,9 +1325,9 @@ def main():
         log.warning("Not running as administrator/root. Some features may fail.")
 
     # Validate destructive whole-disk flags require --force
-    if (args.disk_secure_erase or args.disk_crypto_erase or args.wipe_device) and not args.force and not args.dry_run:
+    if (args.erase or args.overwrite) and not args.force and not args.dry_run:
         log.error(
-            "--disk-secure-erase and --disk-crypto-erase are whole-disk destructive operations.\n"
+            "--erase and --overwrite are whole-device destructive operations.\n"
             "Re-run with --force to confirm, or use --dry-run to preview."
         )
         sys.exit(1)
@@ -1349,7 +1345,7 @@ def main():
     all_files = list(args.files or []) + files_from_list
 
     if not any([all_files, args.dir, args.freespace, args.snapshots,
-                args.disk_secure_erase, args.disk_crypto_erase, args.wipe_device]):
+                args.erase, args.overwrite]):
         log.error("No action specified. Use --help to see available options.")
         sys.exit(1)
 
@@ -1371,8 +1367,6 @@ def main():
 
     session_start = time.monotonic()
     results = []
-    # Collect unique mount points that need fstrim after deletions
-    trim_mounts: set = set()
 
     # 1. Delete snapshots first (before touching the disk)
     if args.snapshots:
@@ -1387,8 +1381,6 @@ def main():
             log_storage_info(info)
             ok = shred_file(f, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
             results.append((f"File: {f}", ok))
-            if args.trim and info.mount_point:
-                trim_mounts.add(info.mount_point)
 
     # 3. Secure directory deletion
     if args.dir:
@@ -1398,8 +1390,6 @@ def main():
         ok = shred_dir(args.dir, sequence=sequence, dry_run=args.dry_run, verify=args.verify,
                        exclude=args.exclude, force=args.force)
         results.append((f"Dir: {args.dir}", ok))
-        if args.trim and info.mount_point:
-            trim_mounts.add(info.mount_point)
 
     # 4. Free space overwrite
     if args.freespace:
@@ -1408,34 +1398,19 @@ def main():
         log_storage_info(info)
         ok = overwrite_free_space(args.freespace, passes=freespace_passes, dry_run=args.dry_run)
         results.append(("Free space", ok))
-        if args.trim and info.mount_point:
-            trim_mounts.add(info.mount_point)
 
-    # 5. TRIM (advisory, after all deletions so freed blocks are maximised)
-    if args.trim and trim_mounts:
-        log.info("\n-- TRIM -----------------------------------------------------------")
-        for mount in sorted(trim_mounts):
-            ok = fstrim_mount(mount, dry_run=args.dry_run)
-            results.append((f"TRIM: {mount}", ok))
-
-    # 6. Direct device overwrite (works on USB and any block device)
-    if args.wipe_device:
-        log.info("\n-- Device Wipe (WHOLE DEVICE) ------------------------------------")
-        ok = wipe_device(args.wipe_device, sequence=sequence, dry_run=args.dry_run,
+    # 5. Direct device overwrite — software, byte-by-byte; works on USB and any block device
+    if args.overwrite:
+        log.info("\n-- Device Overwrite (WHOLE DEVICE) -----------------------------------")
+        ok = wipe_device(args.overwrite, sequence=sequence, dry_run=args.dry_run,
                          verify=args.verify)
-        results.append((f"Device Wipe: {args.wipe_device}", ok))
+        results.append((f"Overwrite: {args.overwrite}", ok))
 
-    # 7. ATA Secure Erase / NVMe Sanitize (whole disk)
-    if args.disk_secure_erase:
-        log.info("\n-- Disk Secure Erase (WHOLE DISK) --------------------------------")
-        ok = secure_erase_device(args.disk_secure_erase, dry_run=args.dry_run)
-        results.append((f"Disk Secure Erase: {args.disk_secure_erase}", ok))
-
-    # 7. LUKS crypto-erase (destroy key slots, whole volume)
-    if args.disk_crypto_erase:
-        log.info("\n-- Disk Crypto-Erase (WHOLE VOLUME) ------------------------------")
-        ok = crypto_erase_luks(args.disk_crypto_erase, dry_run=args.dry_run)
-        results.append((f"Disk Crypto-Erase: {args.disk_crypto_erase}", ok))
+    # 6. Firmware-level erase — LUKS crypto-erase → ATA/NVMe Secure Erase (whole device)
+    if args.erase:
+        log.info("\n-- Device Erase (WHOLE DEVICE) ---------------------------------------")
+        ok = erase_device(args.erase, dry_run=args.dry_run)
+        results.append((f"Erase: {args.erase}", ok))
 
     # Final summary
     session_elapsed = time.monotonic() - session_start

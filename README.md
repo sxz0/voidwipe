@@ -11,7 +11,8 @@ A cross-platform Python tool for secure file deletion, free space overwriting, a
 - **Secure file deletion** — multi-pass overwrite before unlinking (rename randomization included)
 - **Recursive directory shredding** — wipes every file inside a directory tree, then removes it
 - **Free space overwriting** — fills free blocks with patterned data to overwrite unlinked file remnants
-- **Direct device wipe** — overwrites an entire block device byte-by-byte; works on USB drives and any device where ATA Secure Erase is unavailable
+- **Device overwrite** — overwrites an entire block device byte-by-byte in software; works on USB drives and any block device (`--overwrite`)
+- **Firmware-level device erase** — auto-selects LUKS crypto-erase or ATA/NVMe Secure Erase for the strongest available guarantee (`--erase`)
 - **Snapshot/shadow copy removal** — removes VSS (Windows), LVM snapshots (Linux), APFS snapshots (macOS)
 - **Multiple pass methods** — Default 4-pass, DoD 3-pass, DoD 7-pass, Gutmann 35-pass
 - **Read-back verification** — confirms deterministic passes were written correctly
@@ -69,7 +70,7 @@ pip install -e .
 voidwipe [--files FILE ...] [--files-from FILE] [--dir DIRECTORY] [--exclude PATTERN ...]
          [--freespace DIRECTORY] [--snapshots]
          [--method METHOD] [--passes N] [--freespace-passes N] [--verify]
-         [--wipe-device DEVICE] [--trim] [--disk-secure-erase DEVICE] [--disk-crypto-erase DEVICE]
+         [--overwrite DEVICE] [--erase DEVICE]
          [--force] [-q] [--json] [--dry-run] [--log FILE]
 ```
 
@@ -95,15 +96,13 @@ voidwipe [--files FILE ...] [--files-from FILE] [--dir DIRECTORY] [--exclude PAT
 | `--freespace-passes N` | Passes for free space overwrite (default: matches `--method`/`--passes`) |
 | `--verify` | Read-back verify each deterministic overwrite pass |
 
-#### SSD operations
+#### Device operations
 
 | Flag | Description |
 |---|---|
-| `--wipe-device DEVICE` | Overwrite every byte of DEVICE directly (e.g. `/dev/sda`). Works on USB and any block device. Requires `--force` and root |
-| `--trim` | Run `fstrim` on target filesystem(s) after deletion (Linux only, advisory) |
-| `--disk-secure-erase DEVICE` | Issue ATA Secure Erase (SATA) or NVMe Sanitize (NVMe) to DEVICE. **Whole-disk, irreversible.** Requires `--force` and root. Not supported on USB drives — use `--wipe-device` instead |
-| `--disk-crypto-erase DEVICE` | Destroy all LUKS key slots on DEVICE. **Whole-volume, irreversible.** Requires `--force` and root |
-| `--force` | Skip confirmation prompts. Required for `--wipe-device`, `--disk-secure-erase`, and `--disk-crypto-erase`; also bypasses the `--dir` prompt |
+| `--overwrite DEVICE` | Write over every byte of DEVICE in software (e.g. `/dev/sda`). Works on all drive types including USB. On SSDs, best-effort due to FTL. **Whole-device, irreversible.** Requires `--force` and root |
+| `--erase DEVICE` | Firmware-level erase: LUKS crypto-erase if encrypted, otherwise ATA Secure Erase (SATA) or NVMe Sanitize. Not supported on USB — use `--overwrite` instead. **Whole-device, irreversible.** Requires `--force` and root |
+| `--force` | Skip confirmation prompts. Required for `--overwrite` and `--erase`; also bypasses the `--dir` prompt |
 
 #### General
 
@@ -150,18 +149,12 @@ voidwipe --files secret.txt --method dod7 --verify --log voidwipe.log
 # Delete snapshots + free space (requires root)
 sudo voidwipe --snapshots --freespace /
 
-# Wipe an entire USB drive (works where ATA Secure Erase doesn't)
-sudo voidwipe --wipe-device /dev/sda --force
+# Overwrite every byte of a USB drive in software (DoD 3-pass, dry-run first)
+sudo voidwipe --overwrite /dev/sdb --method dod3 --force --dry-run
+sudo voidwipe --overwrite /dev/sdb --method dod3 --force
 
-# Wipe a USB drive with DoD 3-pass, dry-run first
-sudo voidwipe --wipe-device /dev/sda --method dod3 --force --dry-run
-sudo voidwipe --wipe-device /dev/sda --method dod3 --force
-
-# ATA Secure Erase a SATA drive (whole disk, firmware-level)
-sudo voidwipe --disk-secure-erase /dev/sda --force
-
-# Destroy LUKS key slots (whole volume becomes unreadable)
-sudo voidwipe --disk-crypto-erase /dev/sda --force
+# Firmware-level erase of an SSD (auto-selects LUKS crypto-erase or ATA/NVMe Secure Erase)
+sudo voidwipe --erase /dev/sda --force
 
 # Preview all actions without making changes
 voidwipe --files secret.txt --freespace /home --dry-run
@@ -180,11 +173,10 @@ voidwipe --files secret.txt --json
 
 | Tier | Method | Notes |
 |---|---|---|
-| 1 | Multi-pass overwrite (`--files`, `--wipe-device`) | Best-effort; FTL may retain copies in over-provisioned cells |
-| 2 | `--trim` (Linux, advisory) | Hints drive firmware to zero free blocks; not guaranteed |
-| 3 | `--wipe-device` | Overwrites every addressable byte; works on USB; still subject to FTL on SSDs |
-| 4 | `--disk-secure-erase` | Drive firmware erases all cells including over-provisioned NAND; SATA/NVMe only, not USB |
-| 5 | `--disk-crypto-erase` | Destroys LUKS key; ciphertext unreadable without key — strongest per-volume guarantee |
+| 1 | Multi-pass overwrite (`--files`, `--dir`, `--freespace`) | Best-effort; FTL may retain copies in over-provisioned cells |
+| 2 | `--overwrite DEVICE` | Overwrites every addressable byte in software; works on USB; still subject to FTL on SSDs |
+| 3 | `--erase DEVICE` (ATA/NVMe) | Drive firmware erases all cells including over-provisioned NAND; SATA/NVMe only, not USB |
+| 4 | `--erase DEVICE` (LUKS) | Destroys the encryption key; ciphertext unreadable without key — strongest per-volume guarantee |
 
 ---
 
@@ -193,7 +185,7 @@ voidwipe --files secret.txt --json
 | Scenario | Limitation |
 |---|---|
 | SSD / NVMe | FTL wear-leveling and TRIM prevent guaranteed overwrite of specific blocks |
-| USB drives | ATA Secure Erase is blocked by USB bridges — use `--wipe-device` instead |
+| USB drives | Firmware erase (`--erase`) is blocked by USB bridges — use `--overwrite` instead |
 | btrfs / ZFS / APFS | Copy-on-Write writes to new blocks; original blocks may persist |
 | Encrypted volumes | Rekeying the volume is more reliable than file-level overwriting |
 | Network filesystems | Physical overwrite guarantees depend entirely on the remote system |
