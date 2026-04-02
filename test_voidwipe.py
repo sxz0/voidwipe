@@ -4,7 +4,6 @@ Run with: python3 -m pytest test_voidwipe.py -v
 """
 
 import hashlib
-import io
 import json
 import os
 import subprocess
@@ -100,52 +99,56 @@ class TestPatternGenerators:
 
 class TestWritePasses:
 
-    def test_fixed_pass_overwrites_every_byte(self):
+    def test_fixed_pass_overwrites_every_byte(self, tmp_path):
         size = CHUNK_SIZE + 512  # spans two chunks
-        original = os.urandom(size)
-        buf = io.BytesIO(original)
+        p = tmp_path / "data.bin"
+        p.write_bytes(os.urandom(size))
         sequence = [("0xFF", _make_fixed(0xFF))]
-        _write_passes(buf, size, sequence, progress=False)
-        buf.seek(0)
-        result = buf.read()
+        with open(p, "r+b") as f:
+            _write_passes(f, size, sequence, progress=False)
+        result = p.read_bytes()
         assert result == bytes([0xFF]) * size
 
-    def test_random_pass_changes_content(self):
+    def test_random_pass_changes_content(self, tmp_path):
         size = 4096
+        p = tmp_path / "data.bin"
         original = bytes([0x00]) * size
-        buf = io.BytesIO(original)
+        p.write_bytes(original)
         sequence = [("Random", pattern_random)]
-        _write_passes(buf, size, sequence, progress=False)
-        buf.seek(0)
-        result = buf.read()
-        assert result != original
+        with open(p, "r+b") as f:
+            _write_passes(f, size, sequence, progress=False)
+        assert p.read_bytes() != original
 
-    def test_multiple_passes_execute(self):
+    def test_multiple_passes_execute(self, tmp_path):
         size = 4096
-        buf = io.BytesIO(b"\xAA" * size)
+        p = tmp_path / "data.bin"
+        p.write_bytes(b"\xAA" * size)
         sequence = list(PASS_METHODS["dod3"])
-        _write_passes(buf, size, sequence, progress=False)
-        buf.seek(0)
-        result = buf.read()
-        # Final pass of dod3 is random — just check it completed and content changed
-        assert len(result) == size
+        with open(p, "r+b") as f:
+            _write_passes(f, size, sequence, progress=False)
+        assert len(p.read_bytes()) == size
 
-    def test_zero_size_file_no_error(self):
-        buf = io.BytesIO(b"")
-        _write_passes(buf, 0, PASS_METHODS["default"], progress=False)
+    def test_zero_size_file_no_error(self, tmp_path):
+        p = tmp_path / "empty.bin"
+        p.write_bytes(b"")
+        with open(p, "r+b") as f:
+            _write_passes(f, 0, PASS_METHODS["default"], progress=False)
 
-    def test_verify_pass_detects_correct_write(self, capsys):
+    def test_verify_pass_detects_correct_write(self, tmp_path):
         size = 4096
-        buf = io.BytesIO(b"\x00" * size)
+        p = tmp_path / "data.bin"
+        p.write_bytes(b"\x00" * size)
         sequence = [("0xFF", _make_fixed(0xFF))]
-        # Should not raise or log a warning for a correct write
-        _write_passes(buf, size, sequence, verify=True, progress=False)
+        with open(p, "r+b") as f:
+            _write_passes(f, size, sequence, verify=True, progress=False)
 
-    def test_all_methods_run_without_error(self):
+    def test_all_methods_run_without_error(self, tmp_path):
         size = CHUNK_SIZE * 2
         for method in ("default", "dod3", "dod7"):
-            buf = io.BytesIO(os.urandom(size))
-            _write_passes(buf, size, list(PASS_METHODS[method]), progress=False)
+            p = tmp_path / f"{method}.bin"
+            p.write_bytes(os.urandom(size))
+            with open(p, "r+b") as f:
+                _write_passes(f, size, list(PASS_METHODS[method]), progress=False)
 
 
 # ─────────────────────────────────────────────
