@@ -478,7 +478,7 @@ def wipe_device(device: str, sequence: list, dry_run: bool = False,
         log.error(f"  Device not found: {device}")
         return False
 
-    # Determine device size via lsblk (Linux) or fallback seek
+    # Determine device size
     size = None
     if SYSTEM == "Linux":
         try:
@@ -489,9 +489,25 @@ def wipe_device(device: str, sequence: list, dry_run: bool = False,
             size = int(result.stdout.strip())
         except Exception:
             pass
+    elif SYSTEM == "Darwin":
+        try:
+            result = subprocess.run(
+                ["diskutil", "info", device],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                # "Disk Size: 15.5 GB (15669821440 Bytes) ..."
+                if "Disk Size" in line or "Total Size" in line:
+                    m = re.search(r"\((\d+)\s+Bytes?\)", line)
+                    if m:
+                        size = int(m.group(1))
+                        break
+        except Exception:
+            pass
 
     if size is None:
-        # Fallback: open and seek to end
+        # Fallback: open and seek to end (works on Linux/macOS for block devices
+        # exposed as character devices, and on Windows raw volumes)
         try:
             with open(device, "rb") as f:
                 f.seek(0, 2)
@@ -499,6 +515,13 @@ def wipe_device(device: str, sequence: list, dry_run: bool = False,
         except Exception as e:
             log.error(f"  Could not determine device size: {e}")
             return False
+
+    if size == 0:
+        log.error(
+            f"  Device size reported as 0 for {device}. "
+            "On macOS, use the full disk path (e.g. /dev/rdisk2), not a partition."
+        )
+        return False
 
     transport = _get_device_transport(device)
     transport_note = f" [{transport.upper()}]" if transport else ""
@@ -691,6 +714,9 @@ CHUNK_SIZE = 1024 * 1024               # 1 MB per chunk
 FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
 
 
+_PROGRESS_TTY = sys.stderr.isatty()
+
+
 def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
     """
     Execute the overwrite pass sequence on an open file descriptor.
@@ -708,7 +734,6 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         f.seek(0)
         written = 0
         last_chunk = None
-        last_pct_milestone = 0
         pass_start = time.monotonic()
 
         while written < file_size:
@@ -717,12 +742,12 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
             f.write(data)
             written += chunk_size
 
-            if show_progress:
+            if show_progress and _PROGRESS_TTY:
+                elapsed = time.monotonic() - pass_start
+                mbps = (written / (1024 ** 2)) / elapsed if elapsed > 0 else 0
                 pct = written * 100 // file_size
-                milestone = (pct // 25) * 25
-                if milestone > last_pct_milestone:
-                    last_pct_milestone = milestone
-                    log.info(f"    {milestone}%")
+                sys.stderr.write(f"\r    {pct:3d}% — {mbps:.1f} MB/s  ")
+                sys.stderr.flush()
 
             if verify and not is_random:
                 last_chunk = data
@@ -731,6 +756,11 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         os.fsync(f.fileno())  # Force physical write to disk
         elapsed = time.monotonic() - pass_start
         mbps = (file_size / (1024 ** 2)) / elapsed if elapsed > 0 else 0
+
+        if show_progress and _PROGRESS_TTY:
+            sys.stderr.write("\r" + " " * 30 + "\r")  # clear the progress line
+            sys.stderr.flush()
+
         log.info(f"    Done in {elapsed:.1f}s ({mbps:.1f} MB/s)")
 
         if verify and not is_random and last_chunk is not None:
@@ -1348,6 +1378,57 @@ def main():
                 args.erase, args.overwrite]):
         log.error("No action specified. Use --help to see available options.")
         sys.exit(1)
+
+    # ── Pre-flight validation ─────────────────────────────────────────────────
+    # Check all targets before starting any destructive operation so that a
+    # typo or missing file doesn't leave things half-done.
+    preflight_errors = []
+
+    for filepath in all_files:
+        p = Path(filepath)
+        if p.is_symlink():
+            preflight_errors.append(f"  {filepath}: is a symlink (only the link would be affected, not the target)")
+        elif not p.exists():
+            preflight_errors.append(f"  {filepath}: file not found")
+        elif not p.is_file():
+            preflight_errors.append(f"  {filepath}: not a regular file")
+        elif not os.access(filepath, os.R_OK | os.W_OK):
+            preflight_errors.append(f"  {filepath}: no read/write permission")
+
+    if args.dir:
+        d = Path(args.dir)
+        if not d.exists():
+            preflight_errors.append(f"  {args.dir}: directory not found")
+        elif not d.is_dir():
+            preflight_errors.append(f"  {args.dir}: not a directory")
+        elif not os.access(args.dir, os.R_OK | os.X_OK):
+            preflight_errors.append(f"  {args.dir}: no read permission")
+
+    if args.freespace:
+        fp = Path(args.freespace)
+        if not fp.exists():
+            preflight_errors.append(f"  {args.freespace}: path not found")
+        elif not fp.is_dir():
+            preflight_errors.append(f"  {args.freespace}: not a directory")
+        elif not os.access(args.freespace, os.W_OK):
+            preflight_errors.append(f"  {args.freespace}: no write permission (needed to create temp file)")
+
+    for flag, device in [("--overwrite", args.overwrite), ("--erase", args.erase)]:
+        if not device:
+            continue
+        dp = Path(device)
+        if not dp.exists():
+            preflight_errors.append(f"  {device}: device not found")
+        elif not (dp.is_block_device() or dp.is_char_device()):
+            preflight_errors.append(f"  {device}: not a block/character device")
+        elif not is_admin():
+            preflight_errors.append(f"  {flag} {device}: requires root privileges")
+
+    if preflight_errors:
+        log.error("Pre-flight check failed — no changes made:\n" + "\n".join(preflight_errors))
+        sys.exit(1)
+
+    log.info("Pre-flight checks passed.")
 
     # Build the pass sequence
     sequence = list(PASS_METHODS[args.method])
