@@ -611,6 +611,10 @@ def crypto_erase_luks(device: str, dry_run: bool = False) -> bool:
 # OVERWRITE PATTERN GENERATORS
 # ─────────────────────────────────────────────
 
+CHUNK_SIZE = 8 * 1024 * 1024           # 8 MB per chunk
+FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
+
+
 def pattern_random(size: int) -> bytes:
     """Fully random bytes (os.urandom — cryptographic quality)."""
     return os.urandom(size)
@@ -713,10 +717,6 @@ _FREE_SPACE_PATTERN_CYCLE = [_make_fixed(0x00), _make_fixed(0xFF), pattern_rando
 # ─────────────────────────────────────────────
 # SECURE FILE DELETION
 # ─────────────────────────────────────────────
-
-CHUNK_SIZE = 8 * 1024 * 1024           # 8 MB per chunk
-FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
-
 
 _PROGRESS_TTY = sys.stderr.isatty()
 
