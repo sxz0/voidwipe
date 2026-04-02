@@ -10,13 +10,17 @@ A cross-platform Python tool for secure file deletion, free space overwriting, a
 
 - **Secure file deletion** — multi-pass overwrite before unlinking (rename randomization included)
 - **Recursive directory shredding** — wipes every file inside a directory tree, then removes it
-- **Free space overwriting** — fills free blocks with patterned data to overwrite unlinked file remnants
+- **Free space overwriting** — fills free blocks with patterned data to overwrite unlinked file remnants; uses `cipher /w` on Windows NTFS automatically
 - **Device overwrite** — overwrites an entire block device byte-by-byte in software; works on USB drives and any block device (`--overwrite`)
 - **Firmware-level device erase** — auto-selects LUKS crypto-erase or ATA/NVMe Secure Erase for the strongest available guarantee (`--erase`)
 - **Snapshot/shadow copy removal** — removes VSS (Windows), LVM snapshots (Linux), APFS snapshots (macOS)
 - **Multiple pass methods** — Default 4-pass, DoD 3-pass, DoD 7-pass, Gutmann 35-pass
 - **Read-back verification** — confirms deterministic passes were written correctly
+- **Real-time progress** — live per-pass progress line with current MB/s when stderr is a TTY
 - **Per-pass timing and throughput** — logs elapsed time and MB/s for each pass
+- **Pre-flight validation** — checks all targets before starting; reports all errors at once
+- **Parallel shredding** — shred multiple files simultaneously with `--jobs N`
+- **SHA-256 audit trail** — log file hashes before deletion with `--hash`
 - **Dry-run mode** — preview all actions without making any changes
 - **CoW filesystem detection** — warns when overwrite cannot guarantee physical erasure
 - **Detailed logging** — optional log file output
@@ -69,7 +73,7 @@ pip install -e .
 ```
 voidwipe [--files FILE ...] [--files-from FILE] [--dir DIRECTORY] [--exclude PATTERN ...]
          [--freespace DIRECTORY] [--snapshots]
-         [--method METHOD] [--passes N] [--freespace-passes N] [--verify]
+         [--method METHOD] [--passes N] [--freespace-passes N] [--verify] [--hash] [--jobs N]
          [--overwrite DEVICE] [--erase DEVICE]
          [--force] [-q] [--json] [--dry-run] [--log FILE]
 ```
@@ -95,6 +99,8 @@ voidwipe [--files FILE ...] [--files-from FILE] [--dir DIRECTORY] [--exclude PAT
 | `--passes N` | Override pass count; extra passes beyond the method's count use random data |
 | `--freespace-passes N` | Passes for free space overwrite (default: matches `--method`/`--passes`) |
 | `--verify` | Read-back verify each deterministic overwrite pass |
+| `--hash` | Log SHA-256 digest of each file before overwriting (audit trail) |
+| `--jobs N` | Shred files in parallel with N workers (default: 1). Applies to `--files` and `--dir` |
 
 #### Device operations
 
@@ -145,6 +151,12 @@ voidwipe --freespace /home
 
 # Full run: DoD 7-pass with verification and logging
 voidwipe --files secret.txt --method dod7 --verify --log voidwipe.log
+
+# Log SHA-256 hash before deletion (audit trail)
+voidwipe --files secret.txt --hash --log audit.log
+
+# Shred a large directory using 4 parallel workers
+voidwipe --dir /home/user/sensitive/ --jobs 4 --force
 
 # Delete snapshots + free space (requires root)
 sudo voidwipe --snapshots --freespace /

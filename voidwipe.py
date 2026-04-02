@@ -23,11 +23,13 @@ import re
 import time
 import json
 import fnmatch
+import hashlib
 import platform
 import logging
 import argparse
 import subprocess
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
@@ -616,8 +618,9 @@ def pattern_random(size: int) -> bytes:
 
 def _make_fixed(byte_val: int):
     """Return a generator that fills with a single repeated byte value."""
+    _buf = bytes([byte_val]) * CHUNK_SIZE
     def gen(size: int) -> bytes:
-        return bytes([byte_val]) * size
+        return _buf if size == CHUNK_SIZE else _buf[:size]
     gen.__name__ = f"0x{byte_val:02X}"
     gen._deterministic = True
     gen._byte_val = byte_val
@@ -626,8 +629,9 @@ def _make_fixed(byte_val: int):
 
 def _make_repeat(pattern: bytes):
     """Return a generator that tiles a multi-byte pattern."""
+    _buf = (pattern * (CHUNK_SIZE // len(pattern) + 1))[:CHUNK_SIZE]
     def gen(size: int) -> bytes:
-        return (pattern * (size // len(pattern) + 1))[:size]
+        return _buf if size == CHUNK_SIZE else _buf[:size]
     gen.__name__ = ":".join(f"{b:02x}" for b in pattern)
     gen._deterministic = True
     gen._pattern = pattern
@@ -710,23 +714,25 @@ _FREE_SPACE_PATTERN_CYCLE = [_make_fixed(0x00), _make_fixed(0xFF), pattern_rando
 # SECURE FILE DELETION
 # ─────────────────────────────────────────────
 
-CHUNK_SIZE = 1024 * 1024               # 1 MB per chunk
+CHUNK_SIZE = 8 * 1024 * 1024           # 8 MB per chunk
 FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
 
 
 _PROGRESS_TTY = sys.stderr.isatty()
 
 
-def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
+def _write_passes(f, file_size: int, sequence: list, verify: bool = False,
+                  progress: bool = True):
     """
     Execute the overwrite pass sequence on an open file descriptor.
     If verify=True, the last chunk of each deterministic pass is read back
     and compared against the expected bytes.
+    progress=False suppresses the real-time TTY progress line (used in parallel mode).
     """
     if file_size == 0:
         return
 
-    show_progress = file_size >= 4 * 1024 * 1024  # only for files >= 4 MB
+    show_progress = progress and file_size >= 4 * 1024 * 1024  # only for files >= 4 MB
 
     for i, (label, generator) in enumerate(sequence, 1):
         is_random = generator is pattern_random
@@ -736,9 +742,14 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
         last_chunk = None
         pass_start = time.monotonic()
 
+        rand_buf = os.urandom(CHUNK_SIZE) if is_random else None
+
         while written < file_size:
             chunk_size = min(CHUNK_SIZE, file_size - written)
-            data = generator(chunk_size)
+            if is_random:
+                data = rand_buf if chunk_size == CHUNK_SIZE else rand_buf[:chunk_size]
+            else:
+                data = generator(chunk_size)
             f.write(data)
             written += chunk_size
 
@@ -772,8 +783,18 @@ def _write_passes(f, file_size: int, sequence: list, verify: bool = False):
                 log.warning(f"    Verification FAILED for pass {i} ({label}) — data mismatch.")
 
 
+def _sha256_file(path: Path) -> str:
+    """Return hex SHA-256 digest of a file, reading in chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK_SIZE):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def shred_file(filepath: str, sequence: list = None, dry_run: bool = False,
-               verify: bool = False) -> bool:
+               verify: bool = False, hash_before: bool = False,
+               progress: bool = True) -> bool:
     """
     Overwrites a file with multiple passes, renames it, then deletes it.
     Storage detection and warnings are handled by the caller.
@@ -801,13 +822,20 @@ def shred_file(filepath: str, sequence: list = None, dry_run: bool = False,
     log.info(f"Secure deletion: {filepath} ({file_size / 1024:.1f} KB, {len(sequence)} passes)")
     warn_if_cow(str(path.parent))
 
+    if hash_before:
+        try:
+            digest = _sha256_file(path)
+            log.info(f"  sha256: {digest}  {filepath}")
+        except Exception as e:
+            log.warning(f"  Could not hash {filepath}: {e}")
+
     if dry_run:
         log.info(f"  [DRY RUN] Would overwrite and delete: {filepath}")
         return True
 
     try:
         with open(filepath, "r+b") as f:
-            _write_passes(f, file_size, sequence, verify=verify)
+            _write_passes(f, file_size, sequence, verify=verify, progress=progress)
 
         # Rename before unlinking (makes name-based recovery harder)
         random_name = path.parent / ("_" + os.urandom(8).hex())
@@ -830,7 +858,8 @@ def shred_file(filepath: str, sequence: list = None, dry_run: bool = False,
 
 
 def shred_dir(dirpath: str, sequence: list = None, dry_run: bool = False,
-              verify: bool = False, exclude: list = None, force: bool = False) -> bool:
+              verify: bool = False, exclude: list = None, force: bool = False,
+              jobs: int = 1, hash_before: bool = False) -> bool:
     """
     Recursively shreds all files inside a directory, then removes the empty tree.
     Symlinks are unlinked without following them.
@@ -877,9 +906,19 @@ def shred_dir(dirpath: str, sequence: list = None, dry_run: bool = False,
             return False
 
     all_ok = True
-    for f in files:
-        if not shred_file(str(f), sequence=sequence, verify=verify):
-            all_ok = False
+    if jobs > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = {
+                pool.submit(shred_file, str(f), sequence, False, verify, hash_before, False): f
+                for f in files
+            }
+            for future in as_completed(futures):
+                if not future.result():
+                    all_ok = False
+    else:
+        for f in files:
+            if not shred_file(str(f), sequence=sequence, verify=verify, hash_before=hash_before):
+                all_ok = False
 
     for s in links:
         try:
@@ -957,23 +996,21 @@ def overwrite_free_space(directory: str, passes: int = 2, dry_run: bool = False)
         total_written = 0
         pass_start = time.monotonic()
 
+        rand_buf = os.urandom(CHUNK_SIZE) if gen is pattern_random else None
+
         try:
             with open(tmp_path, "wb") as f:
                 while True:
-                    free = shutil.disk_usage(directory).free
-                    if free <= FREE_SPACE_RESERVE:
-                        break
-                    chunk = min(CHUNK_SIZE, free - FREE_SPACE_RESERVE)
-                    f.write(gen(chunk))
-                    f.flush()
-                    os.fsync(f.fileno())
-                    total_written += chunk
-
-            elapsed = time.monotonic() - pass_start
-            mbps = (total_written / (1024 ** 2)) / elapsed if elapsed > 0 else 0
-            log.info(f"  Written {total_written / (1024**2):.1f} MB in {elapsed:.1f}s ({mbps:.1f} MB/s).")
+                    data = rand_buf if rand_buf is not None else gen(CHUNK_SIZE)
+                    f.write(data)
+                    total_written += CHUNK_SIZE
         except OSError as e:
             if e.errno == 28:  # No space left on device — expected
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
                 elapsed = time.monotonic() - pass_start
                 mbps = (total_written / (1024 ** 2)) / elapsed if elapsed > 0 else 0
                 log.info(f"  Disk full (expected). Pass {p} complete in {elapsed:.1f}s ({mbps:.1f} MB/s).")
@@ -1270,6 +1307,21 @@ LIMITATIONS
             "the drive accepted the writes."
         )
     )
+    passes.add_argument(
+        "--hash", action="store_true", dest="hash_before",
+        help=(
+            "Log the SHA-256 digest of each file before overwriting it. "
+            "Useful as an audit trail to prove what was destroyed."
+        )
+    )
+    passes.add_argument(
+        "--jobs", type=int, default=1, metavar="N",
+        help=(
+            "Number of files to shred in parallel when using --files or --dir "
+            "(default: 1 — sequential). Useful for large batches of small files. "
+            "Has no effect on --overwrite or --freespace."
+        )
+    )
 
     # ── Device operations ─────────────────────────────────────────────────────
     dev = parser.add_argument_group(
@@ -1382,6 +1434,10 @@ def main():
     # ── Pre-flight validation ─────────────────────────────────────────────────
     # Check all targets before starting any destructive operation so that a
     # typo or missing file doesn't leave things half-done.
+    if args.jobs < 1:
+        log.error("--jobs must be at least 1.")
+        sys.exit(1)
+
     preflight_errors = []
 
     for filepath in all_files:
@@ -1457,11 +1513,25 @@ def main():
     # 2. Secure file deletion
     if all_files:
         log.info("\n-- Secure File Deletion -------------------------------------------")
-        for f in all_files:
-            info = detect_storage(f)
-            log_storage_info(info)
-            ok = shred_file(f, sequence=sequence, dry_run=args.dry_run, verify=args.verify)
-            results.append((f"File: {f}", ok))
+        if args.jobs > 1:
+            log.info(f"  Parallel shredding with {args.jobs} workers.")
+            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                def _shred(filepath):
+                    info = detect_storage(filepath)
+                    log_storage_info(info)
+                    return filepath, shred_file(filepath, sequence=sequence, dry_run=args.dry_run,
+                                                verify=args.verify, hash_before=args.hash_before,
+                                                progress=False)
+                for future in as_completed(pool.submit(_shred, filepath) for filepath in all_files):
+                    filepath, ok = future.result()
+                    results.append((f"File: {filepath}", ok))
+        else:
+            for filepath in all_files:
+                info = detect_storage(filepath)
+                log_storage_info(info)
+                ok = shred_file(filepath, sequence=sequence, dry_run=args.dry_run,
+                                verify=args.verify, hash_before=args.hash_before)
+                results.append((f"File: {filepath}", ok))
 
     # 3. Secure directory deletion
     if args.dir:
@@ -1469,7 +1539,8 @@ def main():
         info = detect_storage(args.dir)
         log_storage_info(info)
         ok = shred_dir(args.dir, sequence=sequence, dry_run=args.dry_run, verify=args.verify,
-                       exclude=args.exclude, force=args.force)
+                       exclude=args.exclude, force=args.force,
+                       jobs=args.jobs, hash_before=args.hash_before)
         results.append((f"Dir: {args.dir}", ok))
 
     # 4. Free space overwrite
