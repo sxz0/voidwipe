@@ -5,12 +5,11 @@ Run with: python3 -m pytest test_voidwipe.py -v
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -189,25 +188,8 @@ class TestShredFile:
         assert not p.exists()
 
     def test_content_overwritten_before_delete(self, tmp_path):
-        original = b"SENSITIVE DATA " * 100
         p = tmp_path / "secret.txt"
-        p.write_bytes(original)
-        # Track what was written using a wrapper
-        written_data = []
-        real_open = open
-        def patched_open(path, mode="r", **kwargs):
-            fh = real_open(path, mode, **kwargs)
-            if mode == "r+b" and str(path) == str(p):
-                class TrackingWriter(io.RawIOBase):
-                    def write(self, b):
-                        written_data.append(bytes(b))
-                        return fh.write(b)
-                    def seek(self, *a): return fh.seek(*a)
-                    def flush(self): return fh.flush()
-                    def fileno(self): return fh.fileno()
-                    def tell(self): return fh.tell()
-                return fh
-            return fh
+        p.write_bytes(b"SENSITIVE DATA " * 100)
         ok = shred_file(str(p), sequence=list(PASS_METHODS["dod3"]))
         assert ok is True
         assert not p.exists()
@@ -238,7 +220,6 @@ class TestShredFile:
         assert not p.exists()
 
     def test_hash_before_logs_digest(self, tmp_path, caplog):
-        import logging
         content = b"audit me"
         p = tmp_path / "audit.txt"
         p.write_bytes(content)
@@ -290,7 +271,6 @@ class TestShredDir:
         assert d.exists()
 
     def test_exclude_pattern(self, tmp_path, caplog):
-        import logging
         d = tmp_path / "mixed"
         d.mkdir()
         log_content = b"log data"
@@ -330,7 +310,6 @@ class TestShredDir:
         assert not d.exists()
 
     def test_hash_before_in_dir(self, tmp_path, caplog):
-        import logging
         d = tmp_path / "hashdir"
         d.mkdir()
         content = b"hashable content"

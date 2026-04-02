@@ -611,8 +611,7 @@ def crypto_erase_luks(device: str, dry_run: bool = False) -> bool:
 # OVERWRITE PATTERN GENERATORS
 # ─────────────────────────────────────────────
 
-CHUNK_SIZE = 8 * 1024 * 1024           # 8 MB per chunk
-FREE_SPACE_RESERVE = 64 * 1024 * 1024  # Keep 64 MB free to avoid system instability
+CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB per chunk
 
 
 def pattern_random(size: int) -> bytes:
