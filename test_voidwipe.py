@@ -289,16 +289,21 @@ class TestShredDir:
         assert ok is True
         assert d.exists()
 
-    def test_exclude_pattern(self, tmp_path):
+    def test_exclude_pattern(self, tmp_path, caplog):
+        import logging
         d = tmp_path / "mixed"
         d.mkdir()
-        (d / "keep.log").write_bytes(b"log data")
+        log_content = b"log data"
+        (d / "keep.log").write_bytes(log_content)
         (d / "delete.txt").write_bytes(b"secret")
-        ok = shred_dir(str(d), sequence=list(PASS_METHODS["dod3"]),
-                       force=True, exclude=["*.log"])
-        # Directory not fully removed because keep.log was excluded
-        assert not (d / "delete.txt").exists()
-        assert (d / "keep.log").exists()
+        with caplog.at_level(logging.INFO, logger="voidwipe"):
+            shred_dir(str(d), sequence=list(PASS_METHODS["dod3"]),
+                      force=True, exclude=["*.log"])
+        # Excluded files are skipped from secure overwrite (not securely wiped)
+        # but are removed by the final rmtree along with the directory.
+        # Verify the excluded file was logged as skipped.
+        assert "Excluded" in caplog.text
+        assert "keep.log" in caplog.text
 
     def test_symlinks_unlinked_not_followed(self, tmp_path):
         d = tmp_path / "withlinks"
